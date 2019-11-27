@@ -1,7 +1,10 @@
 import numpy as np
 from scipy.ndimage import minimum_filter1d
 
-def group_observations(double[:] mjd, double[:] mag, double[:] magerr):
+cimport numpy as np
+
+def group_observations(np.ndarray[np.float64_t] mjd, np.ndarray[np.float64_t] mag,
+                       np.ndarray[np.float64_t] magerr):
     """Group observations that are on the same night"""
     # Figure out how long the output array should be
     cdef int lastval = -1
@@ -109,7 +112,7 @@ def detect_dippers(mjd, filterid, psfmag, psfmagerr, xpos, ypos, catflags, verbo
     # Check for sequential runs.
     
     # Get the minimum score for a run.
-    filtered_scores = minimum_filter1d(scores, 3, mode='constant')
+    filtered_scores = minimum_filter1d(scores, 4, mode='constant')
         
     result = float(np.max(filtered_scores))
     max_mjd = grouped_mjds[np.argmax(filtered_scores)]
