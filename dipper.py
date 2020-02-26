@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from IPython.core.display import display, HTML
 
 import pyspark.sql.functions as sparkfunc
-import pyspark.sql.types as pyspark_types
+import pyspark.sql.types as stypes
 
 from functools import partial
 
@@ -58,7 +58,7 @@ def parse_observations(mjd, mag, magerr, xpos, ypos, catflags):
         A list of the y positions on the CCD for each observation.
     catflags : list of floats
         A list of the processing flags for each observation.
-    
+
     Returns
     -------
     parsed_mjd : numpy.array
@@ -95,11 +95,11 @@ def parse_observations(mjd, mag, magerr, xpos, ypos, catflags):
         & (sort_ypos > pad_width)
         & (sort_ypos < y_border - pad_width)
         & (sort_catflags == 0)
-        
+
         # In the oct19 data, some observations have a magerr of 0 and aren't flagged.
         # This causes a world of problems, so throw them out.
         & (sort_magerr > 0)
-        
+
         # In the oct19 data, a lot of dips are the result of bad columns...
         # Unfortunately, in this version of the ZTF data we don't know which amplifier
         # everything came from. To get a reasonably clean sample (with some unnecessary
@@ -119,7 +119,7 @@ def parse_observations(mjd, mag, magerr, xpos, ypos, catflags):
     if np.sum(mask) < 10:
         # Require at least 10 observations to have reasonable statistics.
         return [], [], []
-        
+
     mask_mjd = sort_mjd[mask]
     mask_mag = sort_mag[mask]
     mask_magerr = sort_magerr[mask]
@@ -179,53 +179,55 @@ def analyze_dip(mjd_g, mag_g, magerr_g, xpos_g, ypos_g, catflags_g, mjd_r, mag_r
         MJD corresponding to the last significant observation for the largest dip.
     num_observations : float
         Number of observations in the largest dip.
-    complexity : float
-        An attempt at measuring how complex the largest dip is. This doesn't really
-        work, but should be 1 for a simple dip like a single eclipse, and a larger
-        number for more complex dips.
-    significance : float
-        The significance of th largest dip, measured as the integrated magnitude of the
-        dip divided by the NMAD (a robust estimate of the standard deviation) of the
+    score : float
+        The score of the largest dip, measured as the integrated magnitude of the dip
+        divided by the NMAD (a robust estimate of the standard deviation) of the
         observations away from the dip.
+    significance : float
+        The significance of the largest dip, measured as the total signal-to-noise of
+        all observations in the dip.
+    reference_stability : float
+        The stability of the reference flux away from the dip. This is measured as the
+        standard deviation of the pulls relative to the assumed baseline flux level, and
+        should be 1 for a stable source with a properly calibrated error model.
     num_dips : int
         The number of different dips that were identified in the light curve.
     """
-    
+
     parsed_mjd_g, parsed_mag_g, parsed_magerr_g = parse_observations(
         mjd_g, mag_g, magerr_g, xpos_g, ypos_g, catflags_g
     )
     parsed_mjd_r, parsed_mag_r, parsed_magerr_r = parse_observations(
         mjd_r, mag_r, magerr_r, xpos_r, ypos_r, catflags_r
     )
-    
+
     mjd = np.hstack([parsed_mjd_g, parsed_mjd_r])
     order = np.argsort(mjd)
     mjd = mjd[order]
     mag = np.hstack([parsed_mag_g, parsed_mag_r])[order]
     magerr = np.hstack([parsed_magerr_g, parsed_magerr_r])[order]
-    
+
     significance = mag / magerr
-    
+
     dip_start_mjd = None
-    
+
     best_intmag = -1.
+    best_significance = 0.
     best_start_mjd = float('nan')
     best_end_mjd = float('nan')
     best_num_observations = 0
-    best_complexity = float('nan')
 
     num_dips = 0
 
-    for idx in range(1, len(mjd)):        
+    for idx in range(1, len(mjd)):
         if mjd[idx] - mjd[idx-1] > max_gap:
             # We have a gap in observations larger than our desired threshold.
             # The previous dip (if there was one) can't be used.
-            
+
             # Reset
             dip_start_mjd = None
         elif significance[idx] >= threshold:
             # Found a significant observation. Increase the current nobs.
-
             if dip_start_mjd is None:
                 if significance[idx-1] >= threshold:
                     # Continuation of a dip that we didn't identify the start of.
@@ -238,65 +240,65 @@ def analyze_dip(mjd_g, mag_g, magerr_g, xpos_g, ypos_g, catflags_g, mjd_r, mag_r
                     dip_intmag = 0.
                     dip_num_observations = 1
                     dip_max_mag = mag[idx]
-                    dip_sum_deltas = mag[idx] - magerr[idx]
+                    dip_significance_squared = significance[idx]**2
             else:
                 # Inside of a dip.
                 dip_num_observations += 1
-                
+
                 # Integrate the magnitude using the trapezoid rule.
                 mean_mag = (mag[idx] + mag[idx-1]) / 2.
                 dt = mjd[idx] - mjd[idx-1]
                 dip_intmag += dt * mean_mag
-                
+                dip_significance_squared += significance[idx]**2
+
                 if mag[idx] > dip_max_mag:
                     dip_max_mag = mag[idx]
-                
-                dip_sum_deltas += np.abs(mag[idx] - mag[idx-1]) - magerr[idx]
+
         elif dip_start_mjd is not None:
             # We found the end of a dip. Record it if it is the best one.
-            dip_sum_deltas += mag[idx-1] - magerr[idx]
-            
-            dip_complexity = dip_sum_deltas / dip_max_mag / 2.
-            
             if (dip_intmag > best_intmag
                     and dip_num_observations >= min_num_observations
                     and (mjd[idx-1] - dip_start_mjd) > min_dip_time):
                 best_intmag = dip_intmag
+                best_significance = np.sqrt(dip_significance_squared)
                 best_start_mjd = dip_start_mjd
                 best_end_mjd = mjd[idx-1]
                 best_num_observations = dip_num_observations
-                best_complexity = dip_complexity
 
             # Reset
             dip_start_mjd = None
-    
+
         # Count the total number of dips. We don't care if we capture the edges properly
         # for this, we just care about finding every time that we transition above the
         # threshold. This is helpful for vetoing highly variable objects.
         if significance[idx] > threshold and significance[idx - 1] < threshold:
             num_dips += 1
-            
-    # Get a measure of the significance of the dip by comparing the integrated size
-    # of the dip to the typical variation scale of the light curve. We calculate the typical
-    # variance using observations outside of the 
+
+    # Score the dip by comparing the integrated size of the dip to the typical variation
+    # scale of the light curve. We calculate the typical variance using observations
+    # outside of the 
     mask = (
         ((mjd < best_start_mjd - 5) | (mjd > best_end_mjd + 5))
         & get_separated_times_mask(mjd)
     )
 
-    if np.sum(mask) < 5:
-        dip_significance = 0.
+    if np.sum(mask) < 20:
+        dip_score = 0.
     else:
         mask_std = np.std(mag[mask])
-        dip_significance = best_intmag / mask_std
-                        
+        dip_score = best_intmag / mask_std
+
+    # Measure how stable the light curve is away from the dip
+    reference_stability = np.std(mag[mask] / magerr[mask])
+
     return (
         float(best_intmag),
         float(best_start_mjd),
         float(best_end_mjd),
         int(best_num_observations),
-        float(best_complexity),
-        float(dip_significance),
+        float(dip_score),
+        float(best_significance),
+        float(reference_stability),
         int(num_dips)
     )
 
@@ -342,9 +344,10 @@ def analyze_dip_row(row, *args, **kwargs):
         'start_mjd': result[1],
         'end_mjd': result[2],
         'nobs': result[3],
-        'complexity': result[4],
+        'score': result[4],
         'significance': result[5],
-        'num_dips': result[6],
+        'reference_stability': result[6],
+        'num_dips': result[7],
     }
 
 
@@ -363,14 +366,15 @@ def build_analyze_dip_udf(**kwargs):
         can be run in Spark.
     """
 
-    schema = pyspark_types.StructType([
-        pyspark_types.StructField("intmag", pyspark_types.FloatType(), False),
-        pyspark_types.StructField("start_mjd", pyspark_types.FloatType(), True),
-        pyspark_types.StructField("end_mjd", pyspark_types.FloatType(), True),
-        pyspark_types.StructField("nobs", pyspark_types.IntegerType(), True),
-        pyspark_types.StructField("complexity", pyspark_types.FloatType(), True),
-        pyspark_types.StructField("significance", pyspark_types.FloatType(), False),
-        pyspark_types.StructField("num_dips", pyspark_types.IntegerType(), False),
+    schema = stypes.StructType([
+        stypes.StructField("intmag", stypes.FloatType(), False),
+        stypes.StructField("start_mjd", stypes.FloatType(), True),
+        stypes.StructField("end_mjd", stypes.FloatType(), True),
+        stypes.StructField("nobs", stypes.IntegerType(), True),
+        stypes.StructField("score", stypes.FloatType(), False),
+        stypes.StructField("significance", stypes.FloatType(), False),
+        stypes.StructField("reference_stability", stypes.FloatType(), False),
+        stypes.StructField("num_dips", stypes.IntegerType(), False),
     ])
 
     func = partial(analyze_dip, **kwargs)
@@ -392,7 +396,7 @@ def _plot_light_curve(row, parsed=True):
         subtracts the median magnitude from each filter. Otherwise, the raw observations
         are plotted.
     """
-    plt.figure(figsize=(8, 6), dpi=100)
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
 
     band_colors = {
         'g': 'tab:green',
@@ -419,18 +423,18 @@ def _plot_light_curve(row, parsed=True):
             mag = np.array(row[f'mag_{band}'])[mask]
             magerr = np.array(row[f'magerr_{band}'])[mask]
 
-        plt.errorbar(mjd, mag, magerr, fmt='o', c=band_colors[band], label=f'ZTF-{band}')
+        ax.errorbar(mjd, mag, magerr, fmt='o', c=band_colors[band], label=f'ZTF-{band}')
 
-    plt.xlabel('MJD')
+    ax.set_xlabel('MJD')
     if parsed:
-        plt.ylabel('Magnitude + offset')
+        ax.set_ylabel('Magnitude + offset')
     else:
-        plt.ylabel('Magnitude')
-    plt.legend()
-    plt.title('objid %d' % row['objid'])
-    plt.gca().invert_yaxis()
-    plt.show()
+        ax.set_ylabel('Magnitude')
+    ax.legend()
+    ax.set_title('objid %d' % row['objid'])
+    ax.invert_yaxis()
 
+    return ax
 
 def _print_light_curve_info(row):
     """Plot information about a light curve.
@@ -444,7 +448,7 @@ def _print_light_curve_info(row):
     """
     display(HTML("<a href='http://simbad.u-strasbg.fr/simbad/sim-coo?Coord=%.6f%+.6f&CooFrame=FK5&CooEpoch=2000&CooEqui=2000&CooDefinedFrames=none&Radius=20&Radius.unit=arcsec&submit=submit+query&CoordList='>SIMBAD</link>" % (row['ra'], row['dec'])))
     print("RA+Dec: %.6f%+.6f" % (row['ra'], row['dec']))
-    
+
 
 def plot_light_curve(row, parsed=True, label_dip=True, zoom=False, verbose=True):
     """Plot a light curve.
@@ -479,17 +483,18 @@ def plot_light_curve(row, parsed=True, label_dip=True, zoom=False, verbose=True)
             for key, value in row['dip'].asDict().items():
                 print(f"{key:11s}: {value}")
 
-    _plot_light_curve(row, parsed)
+    ax = _plot_light_curve(row, parsed)
 
     if label_dip:
         start_mjd = row['dip']['start_mjd']
         end_mjd = row['dip']['end_mjd']
-        
-        plt.axvline(start_mjd, c='k', ls='--')
-        plt.axvline(end_mjd, c='k', ls='--')
-        
+
+        ax.axvline(start_mjd, c='k', ls='--')
+        ax.axvline(end_mjd, c='k', ls='--')
+
         if zoom:
-            plt.xlim(start_mjd - 10, end_mjd + 10)
+            zoom_width = 5 * (end_mjd - start_mjd)
+            ax.set_xlim(start_mjd - zoom_width, end_mjd + zoom_width)
 
 
 def plot_interactive(rows):
@@ -506,8 +511,12 @@ def plot_interactive(rows):
     max_idx = len(rows) - 1
 
     def interact_light_curve(idx, parsed=True, label_dip=True, zoom=False,
-                             verbose=True):
-        return plot_light_curve(rows[idx], parsed=parsed, label_dip=label_dip,
-                                zoom=zoom, verbose=verbose)
+                             verbose=True, both_zoom=False):
+        if both_zoom or not zoom:
+            plot_light_curve(rows[idx], parsed=parsed, label_dip=label_dip, zoom=False,
+                             verbose=verbose)
+        if both_zoom or zoom:
+            plot_light_curve(rows[idx], parsed=parsed, label_dip=label_dip, zoom=True,
+                             verbose=verbose)
 
     interact(interact_light_curve, idx=IntSlider(0, 0, max_idx))
