@@ -7,6 +7,7 @@ import pyspark.sql.types as stypes
 
 from collections.abc import Iterable
 from functools import partial
+from collections import defaultdict
 
 def _weighted_median(values, weights):
     """Calculate the weighted median of a set of values
@@ -363,6 +364,10 @@ def measure_dip(mjds, mags, magerrs, window_min_dip_length=5., window_pad=3.,
     # Subtract the baseline level from each band, and combine their observations into a
     # single light curve.
     mjd, mag, magerr = parse_light_curve(mjds, mags, magerrs)
+
+    if len(mjd) == 0:
+        # No light curve to work with
+        return defaultdict(lambda: 0)
 
     pulls = mag / magerr
 
