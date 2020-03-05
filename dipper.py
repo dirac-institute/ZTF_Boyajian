@@ -446,8 +446,18 @@ def measure_dip(mjds, mags, magerrs, window_min_dip_length=5., window_pad=3.,
 
     # Count how many observations are within the dip
     dip_mask = (mjd > result['start_mjd']) & (mjd < result['end_mjd'])
+    dip_pulls = pulls[dip_mask]
     result['observation_count'] = np.sum(dip_mask)
-    result['significant_observation_count'] = np.sum(dip_mask & (pulls > 3.))
+    result['significant_observation_count'] = np.sum(dip_pulls > 3.)
+
+    # Measure properties of the dip between the first and last significant observations.
+    dip_mjd = mjd[dip_mask]
+    significant_mjd = dip_mjd[dip_pulls > 3.]
+    center_pulls = dip_pulls[(dip_mjd >= significant_mjd[0])
+                             & (dip_mjd <= significant_mjd[-1])]
+    result['core_not_significant_fraction'] = \
+        np.sum(center_pulls < 1.) / len(center_pulls)
+    result['significant_width'] = significant_mjd[-1] - significant_mjd[0]
 
     if return_parsed_observations:
         # Return the parsed data used to measure the dip
@@ -530,6 +540,8 @@ def build_measure_dip_udf(**kwargs):
         'window_start_mjd': float,
         'observation_count': int,
         'significant_observation_count': int,
+        'core_not_significant_fraction': float,
+        'significant_width': float,
         'ref_pull_std': float,
         'ref_large_pull_fraction': float,
     }
