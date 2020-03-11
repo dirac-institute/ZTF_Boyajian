@@ -451,13 +451,17 @@ def measure_dip(mjds, mags, magerrs, window_min_dip_length=5., window_pad=3.,
     result['significant_observation_count'] = np.sum(dip_pulls > 3.)
 
     # Measure properties of the dip between the first and last significant observations.
-    dip_mjd = mjd[dip_mask]
-    significant_mjd = dip_mjd[dip_pulls > 3.]
-    center_pulls = dip_pulls[(dip_mjd >= significant_mjd[0])
-                             & (dip_mjd <= significant_mjd[-1])]
-    result['core_not_significant_fraction'] = \
-        np.sum(center_pulls < 1.) / len(center_pulls)
-    result['significant_width'] = significant_mjd[-1] - significant_mjd[0]
+    if result['significant_observation_count'] > 0:
+        dip_mjd = mjd[dip_mask]
+        significant_mjd = dip_mjd[dip_pulls > 3.]
+        center_pulls = dip_pulls[(dip_mjd >= significant_mjd[0])
+                                 & (dip_mjd <= significant_mjd[-1])]
+        result['core_not_significant_fraction'] = \
+            np.sum(center_pulls < 1.) / len(center_pulls)
+        result['significant_width'] = significant_mjd[-1] - significant_mjd[0]
+    else:
+        result['core_not_significant_fraction'] = 1.
+        result['significant_width'] = 0.
 
     if return_parsed_observations:
         # Return the parsed data used to measure the dip
