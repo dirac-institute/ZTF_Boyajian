@@ -5,49 +5,85 @@ from IPython.core.display import display, HTML
 import pyspark.sql.functions as sparkfunc
 import pyspark.sql.types as stypes
 
+from collections.abc import Iterable
 from functools import partial
+from collections import defaultdict
 
-
-def get_separated_times_mask(times, min_dt=0.5):
-    """Get a mask that only selects observations that are separated by a minimum
-    amount of time
+def _weighted_median(values, weights):
+    """Calculate the weighted median of a set of values
 
     Parameters
     ----------
-    times : np.array
-        The list of times to consider. This must be sorted.
-    min_dt : float
-        The minimum time gap to allow.
+    values : ndarray
+        List of values to perform the weighted median over.
+    weights : ndarray
+        List of weights to use.
+    """
+    order = np.argsort(values)
+    sort_values = values[order]
+    sort_weights = weights[order]
+
+    percentiles = np.cumsum(sort_weights / np.sum(sort_weights))
+
+    # Find the first element above the boundary
+    loc = np.argmax(percentiles >= 0.5)
+
+    if loc == 0:
+        # First element is already above median, return it.
+        return sort_values[0]
+    elif percentiles[loc] == 0.5:
+        # Right on a boundary, return the average of the neighboring bins.
+        return (sort_values[loc] + sort_values[loc+1]) / 2.
+    else:
+        # In the middle of a bin, return it.
+        return sort_values[loc]
+
+
+def _calculate_reference_magnitude(times, mags, max_dt=1.):
+    """Calculate the reference magnitude for a light curve.
+
+    We do this by taking the median of all observations. One challenge with this is that
+    if there are many repeated observations, which is the case for some of the ZTF deep
+    fields, they can overwhelm all of the other observations. To mitigate this, we
+    weight each observation by the time between it and the previous observation, with a
+    maximum time difference specified by max_dt.
+
+    Parameters
+    ----------
+    times : ndarray
+        Time of each observation. This must be sorted.
+    mags : ndarray
+        Magnitude of each observation.
+    max_dt : float
+        The maximum time difference to use for weighting observations.
 
     Returns
     -------
-    min_time_mask : np.array
-        The resulting mask, True for valid observations and False for ones that come too
-        close to a previous one.
+    reference_magnitude : float
+        The resulting reference magnitude to use.
     """
-    min_time_mask = (times - np.roll(times, 1)) > min_dt
-    if len(min_time_mask) > 0:
-        min_time_mask[0] = True
-    return min_time_mask
+    weights = np.clip(np.diff(times, prepend=times[0] - max_dt), None, max_dt)
+    reference_magnitude = _weighted_median(mags, weights)
+
+    return reference_magnitude
 
 
-def parse_observations(mjd, mag, magerr, xpos, ypos, catflags):
-    """Parse a list of observations.
+def filter_ztf_observations(mjd, mag, magerr, xpos, ypos, catflags):
+    """Identify and reject any bad ZTF observations, and return the valid ones.
 
-    This method first identifies the set of valid observations and rejects any that are
-    suspected to be bad. We reject any observations with the following characteristics:
+    We reject any observations with the following characteristics:
     - Any processing flags set
+    - Duplicate observations
     - Observations near the edge of a chip
     - Observations near an unflagged bad column.
 
-    We then calculate the median brightness for each light curve, and convert all
-    observations to a difference relative to this median brightness. We return the
-    resulting magnitude differences along with uncertainties, sorted by MJD.
+    We return the resulting magnitude differences along with uncertainties, sorted by
+    MJD.
 
     Parameters
     ----------
     mjd : list of floats
-        A list of the mjd times for each observaion.
+        A list of the mjd times for each observation.
     mag : list of floats
         A list of the observed magnitudes.
     magerr : list of floats
@@ -61,11 +97,11 @@ def parse_observations(mjd, mag, magerr, xpos, ypos, catflags):
 
     Returns
     -------
-    parsed_mjd : numpy.array
+    parsed_mjd : ndarray
         Sorted array of parsed MJDs.
-    parsed_mag : numpy.array
+    parsed_mag : ndarray
         Corresponding magnitude differences relative to the median flux
-    parsed_magerr : numpy.array
+    parsed_magerr : ndarray
         Magnitude uncertainties, including contributions from the intrinsic dispersion
         if applicable.
     """
@@ -116,248 +152,379 @@ def parse_observations(mjd, mag, magerr, xpos, ypos, catflags):
         & ((sort_xpos < 2888) | (sort_xpos > 2895))
     )
 
-    if np.sum(mask) < 10:
-        # Require at least 10 observations to have reasonable statistics.
-        return [], [], []
+    parsed_mjd = sort_mjd[mask]
+    parsed_mag = sort_mag[mask]
+    parsed_magerr = sort_magerr[mask]
 
-    mask_mjd = sort_mjd[mask]
-    mask_mag = sort_mag[mask]
-    mask_magerr = sort_magerr[mask]
-
-    # Calculate statistics on the light curve. To avoid being affected by periods with
-    # many rapid observations, we only consider observations that are separated by
-    # a given amount of time.
-    min_time_mask = get_separated_times_mask(mask_mjd)
-
-    use_mag = mask_mag[min_time_mask]
-
-    # Subtract the reference flux from the observations.
-    base_mag = np.median(use_mag)
-    parsed_mag = mask_mag - base_mag
-
-    return mask_mjd, parsed_mag, mask_magerr
+    return parsed_mjd, parsed_mag, parsed_magerr
 
 
-def analyze_dip(mjd_g, mag_g, magerr_g, xpos_g, ypos_g, catflags_g, mjd_r, mag_r,
-                   magerr_r, xpos_r, ypos_r, catflags_r, max_gap=2.,
-                   min_num_observations=3, min_dip_time=2., threshold=3.):
-    """Analyze a light curve to identify the largest dip and calculate statistics on it.
+def parse_light_curve(mjds, mags, magerrs, min_band_observations=10):
+    """Parse a light curve or set of light curves so that we can identify dips in them.
 
-    A dip is defined as all observations with decrease in the observed magnitude with a
-    significance greater than the given threshold. We require that observations of the
-    dip have a cadence of at most max_gap days, and that there are observations below
-    the theshold on either side of the dip to ensure that we capture the full profile.
-    Note that we merge the filters (after estimating a reference brightness in each
-    band), and compute all of the statistics on the combined light curve.
-
-    We choose the "largest dip" to be the one with the largest integrated magnitude.
-    Dips that aren't fully resolved are rejected.
+    This subtracts out a reference magnitude in each band, and returns a single light
+    curve with all of the resulting measurements combined.
 
     Parameters
     ----------
-    mjd_g, mag_g, ..., xpos_r, ypos_r : lists of floats
-        Properties of observations in each of the g and r bands. See parse_observations
-        for details.
-    max_gap : float
-        Maximum allowed gap between observations in a dip in days.
-    min_num_observations : int
-        Minimum number of observations required to be in a dip.
-    min_dip_time : float
-        Minimum length of a dip between the first and last observation in days.
-    threshold : float
-        Threshold to use when determining if an observation is a significant dip
-        relative to the baseline or not, in number of standard deviations.
+    mjds : iterable or list of iterables
+        List of observation times in each band, or the observation times in a single
+        band.
+    mags : iterable or list of iterables
+        Corresponding measured magnitudes.
+    magerrs : iterable or list of iterables
+        Corresponding measured magnitude uncertainties.
+    min_band_observations : int
+        Minimum number of observations in each band. Bands with fewer than this number
+        will be ignored. If there aren't enough observations, then we can't get a
+        reliable estimate of the reference magnitude.
 
     Returns
     -------
-    intmag : float
-        Integrated magnitude for the largest dip, from the first to the last significant
-        observation.
-    start_mjd : float
-        MJD corresponding to the first significant observation for the largest dip.
-    end_mjd : float
-        MJD corresponding to the last significant observation for the largest dip.
-    num_observations : float
-        Number of observations in the largest dip.
-    score : float
-        The score of the largest dip, measured as the integrated magnitude of the dip
-        divided by the NMAD (a robust estimate of the standard deviation) of the
-        observations away from the dip.
-    significance : float
-        The significance of the largest dip, measured as the total signal-to-noise of
-        all observations in the dip.
-    reference_stability : float
-        The stability of the reference flux away from the dip. This is measured as the
-        standard deviation of the pulls relative to the assumed baseline flux level, and
-        should be 1 for a stable source with a properly calibrated error model.
-    num_dips : int
-        The number of different dips that were identified in the light curve.
+    combined_mjd : ndarray
+        Combined MJDs in each band.
+    combined_mag : ndarray
+        Corresponding magnitudes with the reference subtracted in each band.
+    combined_magerr : ndarray
+        Corresponding magnitude uncertainties in each band.
     """
+    combined_mjd = []
+    combined_mag = []
+    combined_magerr = []
 
-    parsed_mjd_g, parsed_mag_g, parsed_magerr_g = parse_observations(
-        mjd_g, mag_g, magerr_g, xpos_g, ypos_g, catflags_g
-    )
-    parsed_mjd_r, parsed_mag_r, parsed_magerr_r = parse_observations(
-        mjd_r, mag_r, magerr_r, xpos_r, ypos_r, catflags_r
-    )
-
-    mjd = np.hstack([parsed_mjd_g, parsed_mjd_r])
-    order = np.argsort(mjd)
-    mjd = mjd[order]
-    mag = np.hstack([parsed_mag_g, parsed_mag_r])[order]
-    magerr = np.hstack([parsed_magerr_g, parsed_magerr_r])[order]
-
-    significance = mag / magerr
-
-    dip_start_mjd = None
-
-    best_intmag = -1.
-    best_significance = 0.
-    best_start_mjd = float('nan')
-    best_end_mjd = float('nan')
-    best_num_observations = 0
-
-    num_dips = 0
-
-    for idx in range(1, len(mjd)):
-        if mjd[idx] - mjd[idx-1] > max_gap:
-            # We have a gap in observations larger than our desired threshold.
-            # The previous dip (if there was one) can't be used.
-
-            # Reset
-            dip_start_mjd = None
-        elif significance[idx] >= threshold:
-            # Found a significant observation. Increase the current nobs.
-            if dip_start_mjd is None:
-                if significance[idx-1] >= threshold:
-                    # Continuation of a dip that we didn't identify the start of.
-                    # Ignore it.
-                    pass
-                else:
-                    # Found the start of a dip. Start recording it.
-                    dip_start_mjd = mjd[idx]
-
-                    dip_intmag = 0.
-                    dip_num_observations = 1
-                    dip_max_mag = mag[idx]
-                    dip_significance_squared = significance[idx]**2
-            else:
-                # Inside of a dip.
-                dip_num_observations += 1
-
-                # Integrate the magnitude using the trapezoid rule.
-                mean_mag = (mag[idx] + mag[idx-1]) / 2.
-                dt = mjd[idx] - mjd[idx-1]
-                dip_intmag += dt * mean_mag
-                dip_significance_squared += significance[idx]**2
-
-                if mag[idx] > dip_max_mag:
-                    dip_max_mag = mag[idx]
-
-        elif dip_start_mjd is not None:
-            # We found the end of a dip. Record it if it is the best one.
-            if (dip_intmag > best_intmag
-                    and dip_num_observations >= min_num_observations
-                    and (mjd[idx-1] - dip_start_mjd) > min_dip_time):
-                best_intmag = dip_intmag
-                best_significance = np.sqrt(dip_significance_squared)
-                best_start_mjd = dip_start_mjd
-                best_end_mjd = mjd[idx-1]
-                best_num_observations = dip_num_observations
-
-            # Reset
-            dip_start_mjd = None
-
-        # Count the total number of dips. We don't care if we capture the edges properly
-        # for this, we just care about finding every time that we transition above the
-        # threshold. This is helpful for vetoing highly variable objects.
-        if significance[idx] > threshold and significance[idx - 1] < threshold:
-            num_dips += 1
-
-    # Score the dip by comparing the integrated size of the dip to the typical variation
-    # scale of the light curve. We calculate the typical variance using observations
-    # outside of the 
-    mask = (
-        ((mjd < best_start_mjd - 5) | (mjd > best_end_mjd + 5))
-        & get_separated_times_mask(mjd)
-    )
-
-    if np.sum(mask) < 20:
-        dip_score = 0.
+    # Check if we have a single set of observations, or if we were given a set of them
+    # for each filter.
+    if len(mjds) == 0:
+        # No observations... return empty lists.
+        return np.array([]), np.array([]), np.array([])
+    elif isinstance(mjds[0], Iterable):
+        # A list of observations in different filters, can use as is.
+        pass
     else:
-        mask_std = np.std(mag[mask])
-        dip_score = best_intmag / mask_std
+        # Observations in a single filter. Wrap them so we can treat them in the same
+        # way as the previous case.
+        mjds = [mjds]
+        mags = [mags]
+        magerrs = [magerrs]
 
-    # Measure how stable the light curve is away from the dip
-    reference_stability = np.std(mag[mask] / magerr[mask])
+    for mjd, mag, magerr in zip(mjds, mags, magerrs):
+        mjd = np.asarray(mjd)
+        mag = np.asarray(mag)
+        magerr = np.asarray(magerr)
 
-    return (
-        float(best_intmag),
-        float(best_start_mjd),
-        float(best_end_mjd),
-        int(best_num_observations),
-        float(dip_score),
-        float(best_significance),
-        float(reference_stability),
-        int(num_dips)
-    )
+        if len(mjd) < min_band_observations:
+            continue
+
+        # Ensure that everything is sorted.
+        if not np.all(np.diff(mjd) >= 0):
+            # Arrays aren't sorted, fix that.
+            order = np.argsort(mjd)
+            mjd = mjd[order]
+            mag = mag[order]
+            magerr = magerr[order]
+
+        ref_mag = _calculate_reference_magnitude(mjd, mag)
+        sub_mags = np.array(mag) - ref_mag
+
+        combined_mjd.append(mjd)
+        combined_mag.append(sub_mags)
+        combined_magerr.append(magerr)
+
+    if len(combined_mjd) == 0:
+        # No observations found... return empty lists.
+        return np.array([]), np.array([]), np.array([])
+
+    combined_mjd = np.hstack(combined_mjd)
+    order = np.argsort(combined_mjd)
+    combined_mjd = combined_mjd[order]
+    combined_mag = np.hstack(combined_mag)[order]
+    combined_magerr = np.hstack(combined_magerr)[order]
+
+    return combined_mjd, combined_mag, combined_magerr
 
 
-def analyze_dip_row(row, *args, **kwargs):
-    """Wrapper to run analyze_dip on a Spark or pandas row.
+def _interpolate_target(bin_edges, y_vals, idx, target):
+    """Helper to identify when a function y that has been discretized hits value target.
 
-    See `analyze_dip` for details.
+    idx is the first index where y is greater than the target
+    """
+    if idx == 0:
+        y_1 = 0.
+    else:
+        y_1 = y_vals[idx - 1]
+    y_2 = y_vals[idx]
+
+    edge_1 = bin_edges[idx]
+    edge_2 = bin_edges[idx + 1]
+
+    frac = (target - y_1) / (y_2 - y_1)
+    x = edge_1 + frac * (edge_2 - edge_1)
+    return x
+
+
+def _measure_windowed_dip(mjd, mag, magerr, window_start_mjd, window_end_mjd,
+                          dip_edge_percentile=0.05):
+    """Measure the properties of a windowed dip, assuming that there is a single dip in
+    the given range.
+
+    Parameters
+    ----------
+    mjd : ndarray
+        Observation times. Must be sorted.
+    mag : ndarray
+        Corresponding measured magnitudes. The reference level must be subtracted, see
+        `_calculate_reference_magnitude` and `_combine_band_light_curves` for details.
+    magerr : ndarray
+        Corresponding measured magnitude uncertainties.
+    window_start_mjd : float
+        The start of the window to use.
+    window_end_mjd : float
+        The end of the window to use.
+    """
+    window_mask = (mjd > window_start_mjd) & (mjd < window_end_mjd)
+
+    window_mjd = mjd[window_mask]
+    window_mag = mag[window_mask]
+    window_magerr = magerr[window_mask]
+
+    # Treat each observation as a bin in time, and assume that the flux remains the same
+    # in that bin over its entire interval. We assume that the bin edges are the
+    # midpoints of the MJDs of adjacent observations.
+    bin_edges = np.hstack([window_start_mjd, (window_mjd[1:] + window_mjd[:-1]) / 2.,
+                           window_end_mjd])
+    bin_widths = bin_edges[1:] - bin_edges[:-1]
+
+    # Integrate the dip
+    dip_integral = np.sum(window_mag * bin_widths)
+    dip_integral_uncertainty = np.sqrt(np.sum(window_magerr**2 * bin_widths**2))
+
+    # Figure out percentiles for the dip
+    dip_percentiles = np.cumsum(window_mag * bin_widths) / dip_integral
+
+    # Figure out where the 50th percentile of the dip is.
+    dip_idx_center = np.argmax(dip_percentiles > 0.5)
+    dip_mjd_center = _interpolate_target(bin_edges, dip_percentiles, dip_idx_center,
+                                         0.5)
+
+    # Figure out where the edges of the dip are.
+    dip_idx_end = np.argmax(dip_percentiles > 1 - dip_edge_percentile)
+    dip_mjd_end = _interpolate_target(bin_edges, dip_percentiles, dip_idx_end, 1 -
+                                      dip_edge_percentile)
+
+    # Start is a bit tricky because the first bin can actually be above the threshold
+    # sometimes. Watch out for that.
+    if dip_idx_center == 0:
+        dip_idx_start = 0
+        dip_mjd_start = window_start_mjd
+    else:
+        cut_dip_percentiles = dip_percentiles[:dip_idx_center+1]
+        reversed_dip_idx_start = np.argmax(cut_dip_percentiles[::-1] <
+                                           dip_edge_percentile)
+        if reversed_dip_idx_start == 0:
+            dip_idx_start = 0
+        else:
+            dip_idx_start = len(cut_dip_percentiles) - reversed_dip_idx_start
+        dip_mjd_start = _interpolate_target(bin_edges, cut_dip_percentiles,
+                                            dip_idx_start, dip_edge_percentile)
+
+    result = {
+        'integral': dip_integral,
+        'integral_uncertainty': dip_integral_uncertainty,
+        'significance': dip_integral / dip_integral_uncertainty,
+        'start_mjd': dip_mjd_start,
+        'center_mjd': dip_mjd_center,
+        'end_mjd': dip_mjd_end,
+        'length': dip_mjd_end - dip_mjd_start,
+        'window_start_mjd': window_start_mjd,
+        'window_end_mjd': window_end_mjd,
+    }
+    
+    return result
+
+
+def measure_dip(mjds, mags, magerrs, window_min_dip_length=5., window_pad=3.,
+                window_min_significance=1., stat_window_pad=2.,
+                dip_edge_percentile=0.05, return_parsed_observations=False):
+    """Measure the properties of a light curve, assuming that there is a single dip in
+    it.
+
+    This can handle either single single bands or multiple bands. In either case, the
+    baseline level will be subtracted from each band separately.
+
+    Parameters
+    ----------
+    mjds : iterable or list of iterables
+        List of observation times in each band, or the observation times in a single
+        band.
+    mags : iterable or list of iterables
+        Corresponding measured magnitudes.
+    magerrs : iterable or list of iterables
+        Corresponding measured magnitude uncertainties.
+    """
+    # Subtract the baseline level from each band, and combine their observations into a
+    # single light curve.
+    mjd, mag, magerr = parse_light_curve(mjds, mags, magerrs)
+
+    if len(mjd) == 0:
+        # No light curve to work with
+        return defaultdict(lambda: 0)
+
+    pulls = mag / magerr
+
+    # Assume that the highest signal-to-noise observation is part of the dip.
+    guess_dip_idx = np.argmax(pulls)
+    guess_dip_mjd = mjd[guess_dip_idx]
+
+    # Get an initial approximation of the width of the dip by looking at how many
+    # significant sequential observations there are.
+
+    # Forward pass
+    guess_end_idx = guess_dip_idx
+    while guess_end_idx + 1 < len(mjd):
+        if pulls[guess_end_idx + 1] < window_min_significance:
+            break
+        guess_end_idx += 1
+
+    # Backward pass
+    guess_start_idx = guess_dip_idx
+    while guess_start_idx - 1 >= 0:
+        if pulls[guess_start_idx - 1] < window_min_significance:
+            break
+        guess_start_idx -= 1
+
+    num_obs = guess_end_idx - guess_start_idx + 1
+    guess_dip_length = mjd[guess_end_idx] - mjd[guess_start_idx]
+
+    # Do an initial guess for the window to use.
+    guess_window_length = max(guess_dip_length, window_min_dip_length)
+    guess_window_start_mjd = guess_dip_mjd - window_pad * guess_window_length / 2.
+    guess_window_end_mjd = guess_dip_mjd + window_pad * guess_window_length / 2.
+
+    # Make proper measurements of the dip in that window.
+    initial_result = _measure_windowed_dip(mjd, mag, magerr, guess_window_start_mjd,
+                                           guess_window_end_mjd)
+
+    # Build a better window, and redo our measurements of the dip.
+    window_center = initial_result['center_mjd']
+    window_length = max(initial_result['length'], window_min_dip_length)
+    window_start_mjd = window_center - window_pad * window_length / 2.
+    window_end_mjd = window_center + window_pad * window_length / 2.
+
+    # Note: for light curves that miss one side of the dip, we can be very off in our
+    # estimate of the location of the dip. Make sure that the initial observation is
+    # still included in the dip, or things will break.
+    window_start_mjd = min(window_start_mjd, guess_dip_mjd - 1e-9)
+    window_end_mjd = max(window_end_mjd, guess_dip_mjd + 1e-9)
+
+    result = _measure_windowed_dip(mjd, mag, magerr, window_start_mjd, window_end_mjd)
+
+    # Find all of the observations near/far away from the dip so that we can calculate
+    # statistics.
+    stat_window_center = result['center_mjd']
+    stat_window_length = result['length'] * stat_window_pad / 2.
+    stat_window_start_mjd = stat_window_center - stat_window_length
+    stat_window_end_mjd = stat_window_center + stat_window_length
+    stat_window_mask = (mjd > stat_window_start_mjd) & (mjd < stat_window_end_mjd)
+    stat_ref_mask = ~stat_window_mask
+
+    # Find the largest gap in observations near the dip.
+    stat_window_mjd = mjd[stat_window_mask]
+    max_gap = np.max(np.diff(stat_window_mjd, prepend=stat_window_start_mjd,
+                             append=stat_window_end_mjd))
+    result['max_gap'] = max_gap
+
+    # Look at the properties of residuals away from the dip.
+    ref_pulls = pulls[stat_ref_mask]
+    if len(ref_pulls) > 0:
+        ref_pull_std = np.std(ref_pulls)
+        ref_large_pull_fraction = np.sum(np.abs(ref_pulls) > 3.) / len(ref_pulls)
+    else:
+        ref_pull_std = np.nan
+        ref_large_pull_fraction = np.nan
+    result['ref_pull_std'] = ref_pull_std
+    result['ref_large_pull_fraction'] = ref_large_pull_fraction
+
+    # Count how many observations are within the dip
+    dip_mask = (mjd > result['start_mjd']) & (mjd < result['end_mjd'])
+    dip_pulls = pulls[dip_mask]
+    result['observation_count'] = np.sum(dip_mask)
+    result['significant_observation_count'] = np.sum(dip_pulls > 3.)
+
+    # Measure properties of the dip between the first and last significant observations.
+    if result['significant_observation_count'] > 0:
+        dip_mjd = mjd[dip_mask]
+        significant_mjd = dip_mjd[dip_pulls > 3.]
+        center_pulls = dip_pulls[(dip_mjd >= significant_mjd[0])
+                                 & (dip_mjd <= significant_mjd[-1])]
+        result['core_not_significant_fraction'] = \
+            np.sum(center_pulls < 1.) / len(center_pulls)
+        result['significant_width'] = significant_mjd[-1] - significant_mjd[0]
+    else:
+        result['core_not_significant_fraction'] = 1.
+        result['significant_width'] = 0.
+
+    if return_parsed_observations:
+        # Return the parsed data used to measure the dip
+        result['parsed_mjd'] = mjd
+        result['parsed_mag'] = mag
+        result['parsed_magerr'] = magerr
+
+    return result
+
+
+def measure_dip_ztf(mjds, mags, magerrs, all_xpos, all_ypos, all_catflags, **kwargs):
+    valid_mjds = []
+    valid_mags = []
+    valid_magerrs = []
+    for args in zip(mjds, mags, magerrs, all_xpos, all_ypos, all_catflags):
+        valid_mjd, valid_mag, valid_magerr = filter_ztf_observations(*args)
+        valid_mjds.append(valid_mjd)
+        valid_mags.append(valid_mag)
+        valid_magerrs.append(valid_magerr)
+
+    return measure_dip(valid_mjds, valid_mags, valid_magerrs, **kwargs)
+
+
+def measure_dip_row(row, *args, **kwargs):
+    """Wrapper to run measure_dip_ztf on a Spark or pandas row.
+
+    See `measure_dip_ztf` for details.
 
     Parameters
     ----------
     row : Spark row, pandas row, or dict
         The row containing all of the observation data required for `analyze_dip`
     *args
-        Additional arguments to pass to `analyze_dip`
+        Additional arguments to pass to `measure_dip_ztf`
     **kwargs
-        Additional keyword arguments to pass to `analyze_dip`
+        Additional keyword arguments to pass to `measure_dip_ztf`
 
     Returns
     -------
     result : dict
-        A dictionary containing the result from `analyze_dip`.
+        A dictionary containing the result from `measure_dip_ztf`.
     """
-    result = analyze_dip(
-        row['mjd_g'],
-        row['mag_g'],
-        row['magerr_g'],
-        row['xpos_g'],
-        row['ypos_g'],
-        row['catflags_g'],
-        row['mjd_r'],
-        row['mag_r'],
-        row['magerr_r'],
-        row['xpos_r'],
-        row['ypos_r'],
-        row['catflags_r'],
+    result = measure_dip_ztf(
+        (row['mjd_g'], row['mjd_r'], row['mjd_i']),
+        (row['mag_g'], row['mag_r'], row['mag_i']),
+        (row['magerr_g'], row['magerr_r'], row['magerr_i']),
+        (row['xpos_g'], row['xpos_r'], row['xpos_i']),
+        (row['ypos_g'], row['ypos_r'], row['ypos_i']),
+        (row['catflags_g'], row['catflags_r'], row['catflags_i']),
         *args,
         **kwargs
     )
-    
-    return {
-        'intmag': result[0],
-        'start_mjd': result[1],
-        'end_mjd': result[2],
-        'nobs': result[3],
-        'score': result[4],
-        'significance': result[5],
-        'reference_stability': result[6],
-        'num_dips': result[7],
-    }
+
+    return result
 
 
-def build_analyze_dip_udf(**kwargs):
-    """Build a Spark UDF to run `analyze_dip`.
+def build_measure_dip_udf(**kwargs):
+    """Build a Spark UDF to run `measure_single_dip_ztf`.
 
     Parameters
     ----------
     **kwargs
-        Keyword arguments to pass to `analyze_dip`.
+        Keyword arguments to pass to `measure_single_dip_ztf`.
 
     Returns
     -------
@@ -365,25 +532,57 @@ def build_analyze_dip_udf(**kwargs):
         A wrapped function around `analyze_dip` that uses the given kwargs and that
         can be run in Spark.
     """
+    use_keys = {
+        'integral': float,
+        'integral_uncertainty': float,
+        'significance': float,
+        'start_mjd': float,
+        'center_mjd': float,
+        'end_mjd': float,
+        'length': float,
+        'max_gap': float,
+        'window_start_mjd': float,
+        'observation_count': int,
+        'significant_observation_count': int,
+        'core_not_significant_fraction': float,
+        'significant_width': float,
+        'ref_pull_std': float,
+        'ref_large_pull_fraction': float,
+    }
 
-    schema = stypes.StructType([
-        stypes.StructField("intmag", stypes.FloatType(), False),
-        stypes.StructField("start_mjd", stypes.FloatType(), True),
-        stypes.StructField("end_mjd", stypes.FloatType(), True),
-        stypes.StructField("nobs", stypes.IntegerType(), True),
-        stypes.StructField("score", stypes.FloatType(), False),
-        stypes.StructField("significance", stypes.FloatType(), False),
-        stypes.StructField("reference_stability", stypes.FloatType(), False),
-        stypes.StructField("num_dips", stypes.IntegerType(), False),
-    ])
+    sparktype_map = {
+        float: stypes.FloatType,
+        int: stypes.IntegerType,
+    }
 
-    func = partial(analyze_dip, **kwargs)
+    spark_fields = [stypes.StructField(key, sparktype_map[use_type](), True) for key,
+                    use_type in use_keys.items()]
+    schema = stypes.StructType(spark_fields)
 
-    analyze_dip_udf = sparkfunc.udf(func, schema)
+    def _measure_dip_udf(
+            mjd_g, mag_g, magerr_g, xpos_g, ypos_g, catflags_g,
+            mjd_r, mag_r, magerr_r, xpos_r, ypos_r, catflags_r,
+            mjd_i, mag_i, magerr_i, xpos_i, ypos_i, catflags_i,
+            **kwargs
+    ):
+        result = measure_dip_ztf(
+            (mjd_g, mjd_r, mjd_i),
+            (mag_g, mag_r, mag_i),
+            (magerr_g, magerr_r, magerr_i),
+            (xpos_g, xpos_r, xpos_i),
+            (ypos_g, ypos_r, ypos_i),
+            (catflags_g, catflags_r, catflags_i),
+            **kwargs
+        )
 
-    return analyze_dip_udf
+        return [use_type(result[key]) for key, use_type in use_keys.items()]
 
-def _plot_light_curve(row, parsed=True):
+    dip_udf = sparkfunc.udf(partial(_measure_dip_udf, **kwargs), schema)
+
+    return dip_udf
+
+
+def _plot_light_curve(row, parsed=True, show_bins=False):
     """Helper for `plot_light_curve` to do the actual work of plotting a light curve.
 
     Parameters
@@ -406,7 +605,7 @@ def _plot_light_curve(row, parsed=True):
 
     for band in ['g', 'r', 'i']:
         if parsed:
-            mjd, mag, magerr = parse_observations(
+            mjd, mag, magerr = filter_ztf_observations(
                 row[f'mjd_{band}'],
                 row[f'mag_{band}'],
                 row[f'magerr_{band}'],
@@ -414,6 +613,11 @@ def _plot_light_curve(row, parsed=True):
                 row[f'ypos_{band}'],
                 row[f'catflags_{band}'],
             )
+            if len(mjd) < 1:
+                continue
+
+            # Subtract out the zeropoint
+            mjd, mag, magerr = parse_light_curve(mjd, mag, magerr)
         else:
             mask = (
                 (np.array(row[f'catflags_{band}']) == 0.)
@@ -520,3 +724,30 @@ def plot_interactive(rows):
                              verbose=verbose)
 
     interact(interact_light_curve, idx=IntSlider(0, 0, max_idx))
+
+
+def plot_dip(row):
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
+
+    dip_result = measure_dip_row(row, return_parsed_observations=True)
+
+    mjd = dip_result['parsed_mjd']
+    mag = dip_result['parsed_mag']
+    magerr = dip_result['parsed_magerr']
+
+    ax.scatter(mjd, mag, s=5, c='k', zorder=3, label='Individual observations')
+
+    ax.fill_between(mjd, mag, step='mid', alpha=0.2, label='Used profile')
+    ax.plot(mjd, mag, drawstyle='steps-mid', alpha=0.5)
+
+    ax.axvline(dip_result['window_start_mjd'], c='C3', lw=2, label='Window')
+    ax.axvline(dip_result['window_end_mjd'], c='C3', lw=2)
+    ax.axvline(dip_result['start_mjd'], c='C2', lw=2, label='Dip boundary')
+    ax.axvline(dip_result['end_mjd'], c='C2', lw=2)
+    ax.axvline(dip_result['center_mjd'], c='C1', lw=2, label='Dip center')
+
+    ax.set_xlim(dip_result['window_start_mjd'] - 10, dip_result['window_end_mjd'] + 10)
+    ax.legend()
+    ax.invert_yaxis()
+    ax.set_xlabel('MJD')
+    ax.set_ylabel('Magnitude + offset')
