@@ -29,7 +29,7 @@ def identify_dips(res_df):
                      (res_df["significance"] >= 5) &
                      (res_df["ref_pull_std"] < 1.5) &
                      (res_df["ref_large_pull_fraction"] < 0.1) &
-                     (res_df["max_gap"] < 2.)
+                     (res_df["max_gap_fraction"] < 0.8)
                     ]
     
     return dips
