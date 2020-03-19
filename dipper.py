@@ -159,7 +159,7 @@ def filter_ztf_observations(mjd, mag, magerr, xpos, ypos, catflags):
     return parsed_mjd, parsed_mag, parsed_magerr
 
 
-def parse_light_curve(mjds, mags, magerrs, min_band_observations=10):
+def parse_light_curve(mjds, mags, magerrs, mask_window=None, min_band_observations=10):
     """Parse a light curve or set of light curves so that we can identify dips in them.
 
     This subtracts out a reference magnitude in each band, and returns a single light
@@ -174,6 +174,9 @@ def parse_light_curve(mjds, mags, magerrs, min_band_observations=10):
         Corresponding measured magnitudes.
     magerrs : iterable or list of iterables
         Corresponding measured magnitude uncertainties.
+    mask_window : tuple of two floats or None
+        Start and end times of a window to mask out when estimating the background
+        level. If None, no masking is performed.
     min_band_observations : int
         Minimum number of observations in each band. Bands with fewer than this number
         will be ignored. If there aren't enough observations, then we can't get a
@@ -223,8 +226,20 @@ def parse_light_curve(mjds, mags, magerrs, min_band_observations=10):
             mag = mag[order]
             magerr = magerr[order]
 
-        ref_mag = _calculate_reference_magnitude(mjd, mag)
-        sub_mags = np.array(mag) - ref_mag
+        # Mask out a window if desired.
+        if mask_window is not None:
+            mask = (mjd < mask_window[0]) | (mjd > mask_window[1])
+            mask_mjd = mjd[mask]
+            mask_mag = mag[mask]
+
+            if len(mask_mjd) < min_band_observations:
+                continue
+        else:
+            mask_mjd = mjd
+            mask_mag = mag
+
+        ref_mag = _calculate_reference_magnitude(mask_mjd, mask_mag)
+        sub_mags = mag - ref_mag
 
         combined_mjd.append(mjd)
         combined_mag.append(sub_mags)
@@ -259,6 +274,7 @@ def _interpolate_target(bin_edges, y_vals, idx, target):
 
     frac = (target - y_1) / (y_2 - y_1)
     x = edge_1 + frac * (edge_2 - edge_1)
+
     return x
 
 
@@ -287,6 +303,10 @@ def _measure_windowed_dip(mjd, mag, magerr, window_start_mjd, window_end_mjd,
     window_mag = mag[window_mask]
     window_magerr = magerr[window_mask]
 
+    if len(window_mjd) == 0:
+        # No light curve to work with
+        return None
+
     # Treat each observation as a bin in time, and assume that the flux remains the same
     # in that bin over its entire interval. We assume that the bin edges are the
     # midpoints of the MJDs of adjacent observations.
@@ -306,26 +326,19 @@ def _measure_windowed_dip(mjd, mag, magerr, window_start_mjd, window_end_mjd,
     dip_mjd_center = _interpolate_target(bin_edges, dip_percentiles, dip_idx_center,
                                          0.5)
 
-    # Figure out where the edges of the dip are.
+    # Figure out where the edges of the dip are. If the threshold is crossed multiple
+    # times, we choose the time closest to the center of the dip.
+    # dip_idx_start = 
+    if dip_percentiles[0] > dip_edge_percentile:
+        dip_idx_start = 0
+    else:
+        dip_idx_start = len(dip_percentiles) - np.argmax(dip_percentiles[::-1] <
+                                                         dip_edge_percentile)
+    dip_mjd_start = _interpolate_target(bin_edges, dip_percentiles,
+                                        dip_idx_start,dip_edge_percentile)
     dip_idx_end = np.argmax(dip_percentiles > 1 - dip_edge_percentile)
     dip_mjd_end = _interpolate_target(bin_edges, dip_percentiles, dip_idx_end, 1 -
                                       dip_edge_percentile)
-
-    # Start is a bit tricky because the first bin can actually be above the threshold
-    # sometimes. Watch out for that.
-    if dip_idx_center == 0:
-        dip_idx_start = 0
-        dip_mjd_start = window_start_mjd
-    else:
-        cut_dip_percentiles = dip_percentiles[:dip_idx_center+1]
-        reversed_dip_idx_start = np.argmax(cut_dip_percentiles[::-1] <
-                                           dip_edge_percentile)
-        if reversed_dip_idx_start == 0:
-            dip_idx_start = 0
-        else:
-            dip_idx_start = len(cut_dip_percentiles) - reversed_dip_idx_start
-        dip_mjd_start = _interpolate_target(bin_edges, cut_dip_percentiles,
-                                            dip_idx_start, dip_edge_percentile)
 
     result = {
         'integral': dip_integral,
@@ -342,9 +355,9 @@ def _measure_windowed_dip(mjd, mag, magerr, window_start_mjd, window_end_mjd,
     return result
 
 
-def measure_dip(mjds, mags, magerrs, window_min_dip_length=5., window_pad=3.,
-                window_min_significance=1., stat_window_pad=2.,
-                dip_edge_percentile=0.05, return_parsed_observations=False):
+def measure_dip(mjds, mags, magerrs, min_window_pad=2., window_pad_fraction=1.5,
+                stat_window_pad_fraction=0.5, dip_edge_percentile=0.05,
+                return_parsed_observations=False):
     """Measure the properties of a light curve, assuming that there is a single dip in
     it.
 
@@ -371,93 +384,108 @@ def measure_dip(mjds, mags, magerrs, window_min_dip_length=5., window_pad=3.,
 
     pulls = mag / magerr
 
-    # Assume that the highest signal-to-noise observation is part of the dip.
+    # Do an initial guess of where the dip is.
+    # Assume that the highest signal-to-noise dipping observation is part of the dip.
     guess_dip_idx = np.argmax(pulls)
     guess_dip_mjd = mjd[guess_dip_idx]
 
-    # Get an initial approximation of the width of the dip by looking at how many
-    # significant sequential observations there are.
-
+    # Get an initial approximation of the width of the dip by moving forward and
+    # backward in time until we hit a non-significant observation.
     # Forward pass
     guess_end_idx = guess_dip_idx
     while guess_end_idx + 1 < len(mjd):
-        if pulls[guess_end_idx + 1] < window_min_significance:
-            break
         guess_end_idx += 1
+        if pulls[guess_end_idx] < 1.:
+            break
 
     # Backward pass
     guess_start_idx = guess_dip_idx
     while guess_start_idx - 1 >= 0:
-        if pulls[guess_start_idx - 1] < window_min_significance:
-            break
         guess_start_idx -= 1
+        if pulls[guess_start_idx] < 1.:
+            break
 
     num_obs = guess_end_idx - guess_start_idx + 1
-    guess_dip_length = mjd[guess_end_idx] - mjd[guess_start_idx]
+    guess_start_mjd = mjd[guess_start_idx]
+    guess_end_mjd = mjd[guess_end_idx]
+    guess_length = guess_end_mjd - guess_start_mjd
 
     # Do an initial guess for the window to use.
-    guess_window_length = max(guess_dip_length, window_min_dip_length)
-    guess_window_start_mjd = guess_dip_mjd - window_pad * guess_window_length / 2.
-    guess_window_end_mjd = guess_dip_mjd + window_pad * guess_window_length / 2.
+    guess_window_pad = max(window_pad_fraction * guess_length, min_window_pad)
+    guess_window_start_mjd = guess_start_mjd - guess_window_pad
+    guess_window_end_mjd = guess_end_mjd + guess_window_pad
 
-    # Make proper measurements of the dip in that window.
-    initial_result = _measure_windowed_dip(mjd, mag, magerr, guess_window_start_mjd,
-                                           guess_window_end_mjd)
-
-    # Build a better window, and redo our measurements of the dip.
-    window_center = initial_result['center_mjd']
-    window_length = max(initial_result['length'], window_min_dip_length)
-    window_start_mjd = window_center - window_pad * window_length / 2.
-    window_end_mjd = window_center + window_pad * window_length / 2.
-
+    # Make initial measurements of the dip to determine the window to use.
     # Note: for light curves that miss one side of the dip, we can be very off in our
     # estimate of the location of the dip. Make sure that the initial observation is
-    # still included in the dip, or things will break.
-    window_start_mjd = min(window_start_mjd, guess_dip_mjd - 1e-9)
-    window_end_mjd = max(window_end_mjd, guess_dip_mjd + 1e-9)
+    # still included in the window, or things will break.
+    initial_result = _measure_windowed_dip(mjd, mag, magerr, guess_window_start_mjd,
+                                           guess_window_end_mjd)
+    window_pad = max(window_pad_fraction * initial_result['length'], min_window_pad)
+    window_start_mjd = min(initial_result['start_mjd'], guess_dip_mjd) - window_pad
+    window_end_mjd = max(initial_result['end_mjd'], guess_dip_mjd) + window_pad
 
+    # Redo the background subtraction with the dip masked out.
+    mjd, mag, magerr = parse_light_curve(mjds, mags, magerrs,
+                                         mask_window=(window_start_mjd, window_end_mjd))
+    pulls = mag / magerr
+
+    # Locate and measure the dip.
     result = _measure_windowed_dip(mjd, mag, magerr, window_start_mjd, window_end_mjd)
+
+    if result is None:
+        # Measurement failed
+        return defaultdict(lambda: 0)
 
     # Find all of the observations near/far away from the dip so that we can calculate
     # statistics.
-    stat_window_center = result['center_mjd']
-    stat_window_length = result['length'] * stat_window_pad / 2.
-    stat_window_start_mjd = stat_window_center - stat_window_length
-    stat_window_end_mjd = stat_window_center + stat_window_length
+    stat_window_pad = result['length'] * stat_window_pad_fraction
+    stat_window_start_mjd = result['start_mjd'] - stat_window_pad
+    stat_window_end_mjd = result['end_mjd'] + stat_window_pad
     stat_window_mask = (mjd > stat_window_start_mjd) & (mjd < stat_window_end_mjd)
-    stat_ref_mask = ~stat_window_mask
 
     # Find the largest gap in observations near the dip.
-    stat_window_mjd = mjd[stat_window_mask]
-    max_gap = np.max(np.diff(stat_window_mjd, prepend=stat_window_start_mjd,
-                             append=stat_window_end_mjd))
+    # Expand out by one to get the gaps at the edges.
+    gap_mask = np.convolve(stat_window_mask, np.ones(3), mode='same') > 0
+    stat_window_mjd = mjd[gap_mask]
+    if len(stat_window_mjd) == 0 or gap_mask[0] or gap_mask[-1]:
+        # Gap extends past the edge of observations, or there are no observations in the
+        # window.
+        max_gap = np.nan
+        max_gap_fraction = np.nan
+    else:
+        max_gap = np.max(np.diff(stat_window_mjd))
+        max_gap_fraction = max_gap / result['length']
     result['max_gap'] = max_gap
+    result['max_gap_fraction'] = max_gap_fraction
 
     # Look at the properties of residuals away from the dip.
-    ref_pulls = pulls[stat_ref_mask]
+    ref_pulls = pulls[~stat_window_mask]
     if len(ref_pulls) > 0:
         ref_pull_std = np.std(ref_pulls)
         ref_large_pull_fraction = np.sum(np.abs(ref_pulls) > 3.) / len(ref_pulls)
     else:
         ref_pull_std = np.nan
         ref_large_pull_fraction = np.nan
+    result['ref_observation_count'] = len(ref_pulls)
     result['ref_pull_std'] = ref_pull_std
     result['ref_large_pull_fraction'] = ref_large_pull_fraction
 
     # Count how many observations are within the dip
     dip_mask = (mjd > result['start_mjd']) & (mjd < result['end_mjd'])
     dip_pulls = pulls[dip_mask]
-    result['observation_count'] = np.sum(dip_mask)
+    result['dip_observation_count'] = np.sum(dip_mask)
     result['significant_observation_count'] = np.sum(dip_pulls > 3.)
 
-    # Measure properties of the dip between the first and last significant observations.
+    # Measure properties of the core of the dip between the first and last significant
+    # observations.
     if result['significant_observation_count'] > 0:
         dip_mjd = mjd[dip_mask]
         significant_mjd = dip_mjd[dip_pulls > 3.]
         center_pulls = dip_pulls[(dip_mjd >= significant_mjd[0])
                                  & (dip_mjd <= significant_mjd[-1])]
         result['core_not_significant_fraction'] = \
-            np.sum(center_pulls < 1.) / len(center_pulls)
+            np.sum(center_pulls < 3.) / len(center_pulls)
         result['significant_width'] = significant_mjd[-1] - significant_mjd[0]
     else:
         result['core_not_significant_fraction'] = 1.
@@ -541,11 +569,13 @@ def build_measure_dip_udf(**kwargs):
         'end_mjd': float,
         'length': float,
         'max_gap': float,
+        'max_gap_fraction': float,
         'window_start_mjd': float,
-        'observation_count': int,
+        'dip_observation_count': int,
         'significant_observation_count': int,
         'core_not_significant_fraction': float,
         'significant_width': float,
+        'ref_observation_count': int,
         'ref_pull_std': float,
         'ref_large_pull_fraction': float,
     }
