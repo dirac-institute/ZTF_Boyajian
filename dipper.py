@@ -276,10 +276,10 @@ def _find_most_significant_dip_fast(mjd, mag, magerr, guess_nobs=3):
     bin_edges = np.hstack([mjd[0], (mjd[1:] + mjd[:-1]) / 2., mjd[-1]])
     bin_widths = bin_edges[1:] - bin_edges[:-1]
 
-    weighted_mag = bin_widths * mag
-    weighted_var = bin_widths**2 * magerr**2
-    # weighted_mag = mag
-    # weighted_var = magerr**2
+    # weighted_mag = bin_widths * mag
+    # weighted_var = bin_widths**2 * magerr**2
+    weighted_mag = mag
+    weighted_var = magerr**2
 
     old_start_idx = -1
     old_end_idx = -1
@@ -464,9 +464,9 @@ def _get_dip_window(dip_start, dip_end, pad_fraction, min_pad_length):
 
 
 def measure_dip(mjds, mags, magerrs, min_num_observations=20, min_significant_count=3,
-                significant_threshold=3., window_pad_fraction=0.5,
-                min_window_pad_length=5., min_significance=10.,
-                return_parsed_observations=False, verbose=False, apply_cuts=False):
+                significant_threshold=3., window_pad_fraction=1.,
+                min_window_pad_length=5., min_significance=5.,
+                return_parsed_observations=False, verbose=False, apply_cuts=True):
     """Measure the properties of a light curve, assuming that there is a single dip in
     it.
 
@@ -484,6 +484,7 @@ def measure_dip(mjds, mags, magerrs, min_num_observations=20, min_significant_co
         Corresponding measured magnitude uncertainties.
     """
     fail_return = defaultdict(lambda: 0)
+    result = {}
 
     # Subtract the baseline level from each band, and combine their observations into a
     # single light curve.
@@ -506,52 +507,35 @@ def measure_dip(mjds, mags, magerrs, min_num_observations=20, min_significant_co
                       f"{min_significant_count}.")
             return fail_return
 
-    # Do an initial measurement of where the dip is.
-    initial_dip_start, initial_dip_end, initial_dip_significance = \
+    # Estimate where the dip is.
+    dip_start, dip_end, core_significance = \
         _find_most_significant_dip_fast(initial_mjd, initial_mag, initial_magerr)
+    result['start_mjd'] = dip_start
+    result['end_mjd'] = dip_end
+    result['core_significance'] = core_significance
 
-    if apply_cuts and initial_dip_significance < min_significance:
+    if apply_cuts and core_significance < min_significance:
         if verbose:
             print(f"Failed dip cuts: significance < {min_significance}")
         return fail_return
 
-    # Redo the background subtraction with the dip masked out to get better background
-    # estimates.
-    initial_window_start, initial_window_end = _get_dip_window(
-        initial_dip_start, initial_dip_end, window_pad_fraction, min_window_pad_length
-    )
-    mjd, mag, magerr = parse_light_curve(
-        mjds, mags, magerrs, mask_window=(initial_window_start, initial_window_end)
-    )
-
-    if len(mjd) < min_num_observations:
-        if verbose:
-            print("Failed to measure dip: not enough observations in second pass.")
-        return fail_return
-
-    # Do the final measurement of where the dip is.
-    dip_start, dip_end, dip_significance = \
-        _find_most_significant_dip_fast(mjd, mag, magerr)
-
-    if apply_cuts and dip_significance < min_significance:
-        if verbose:
-            print(f"Failed dip cuts: significance < {min_significance} in second pass.")
-        return fail_return
-
-    # We have a valid dip. Measure properties of it.
-    result = {
-        'start_mjd': dip_start,
-        'end_mjd': dip_end,
-        'significance': dip_significance,
-    }
-
-    # Build a mask that we can use for other measurements.
+    # Build a window to use for measuring properties of the dip
     window_start, window_end = _get_dip_window(
         dip_start, dip_end, window_pad_fraction, min_window_pad_length
     )
     window_length = window_end - window_start
     result['window_start_mjd'] = window_start
     result['window_end_mjd'] = window_end
+
+    # Redo our estimates of the background levels with the dip masked out.
+    mjd, mag, magerr = parse_light_curve(
+        mjds, mags, magerrs, mask_window=(window_start, window_end)
+    )
+
+    if len(mjd) < min_num_observations:
+        if verbose:
+            print("Failed to measure dip: not enough observations in second pass.")
+        return fail_return
 
     window_mask = (mjd > window_start) & (mjd < window_end)
     window_mjd = mjd[window_mask]
@@ -585,9 +569,17 @@ def measure_dip(mjds, mags, magerrs, min_num_observations=20, min_significant_co
     bin_edges = np.hstack([mjd[0], (mjd[1:] + mjd[:-1]) / 2., mjd[-1]])
     bin_widths = bin_edges[1:] - bin_edges[:-1]
     window_bin_widths = bin_widths[window_mask]
-    result['integral'] = np.sum(window_bin_widths * window_mag)
-    result['integral_uncertainty'] = np.sqrt(np.sum(window_bin_widths**2 *
-                                                    window_magerr**2))
+    dip_integral = np.sum(window_bin_widths * window_mag)
+    dip_integral_uncertainty = np.sqrt(np.sum(window_bin_widths**2 * window_magerr**2))
+    dip_significance = dip_integral / dip_integral_uncertainty
+    result['integral'] = dip_integral
+    result['integral_uncertainty'] = dip_integral_uncertainty
+    result['significance'] = dip_significance
+
+    if apply_cuts and dip_significance < min_significance:
+        if verbose:
+            print(f"Failed dip cuts: significance < {min_significance} in full window.")
+        return fail_return
 
     # Find the largest gap in observations near the dip.
     # Expand out by one to get the gaps at the edges.
@@ -672,6 +664,36 @@ def measure_dip_row(row, *args, **kwargs):
     return result
 
 
+from functools import wraps
+import errno
+import os
+import time
+import signal
+
+class TimeoutError(Exception):
+    pass
+
+def timeout(seconds=1, error_message=os.strerror(errno.ETIME)):
+    def decorator(func):
+        def _handle_timeout(signum, frame):
+            raise TimeoutError(error_message)
+
+        def wrapper(objid, *args, **kwargs):
+            signal.signal(signal.SIGALRM, _handle_timeout)
+            signal.alarm(seconds)
+            try:
+                result = func(*args, **kwargs)
+            except:
+                raise Exception(f"Failed for objid {objid}!")
+            finally:
+                signal.alarm(0)
+            return result
+
+        return wraps(func)(wrapper)
+
+    return decorator
+
+
 def build_measure_dip_udf(**kwargs):
     """Build a Spark UDF to run `measure_single_dip_ztf`.
 
@@ -712,6 +734,7 @@ def build_measure_dip_udf(**kwargs):
                     use_type in use_keys.items()]
     schema = stypes.StructType(spark_fields)
 
+    @timeout()
     def _measure_dip_udf(
             mjd_g, mag_g, magerr_g, xpos_g, ypos_g, catflags_g,
             mjd_r, mag_r, magerr_r, xpos_r, ypos_r, catflags_r,
@@ -756,6 +779,12 @@ def _plot_light_curve(row, parsed=True, show_bins=False):
         'i': 'tab:purple'
     }
 
+    if parsed:
+        # Run the dipper finder to find the region of the light curve that gets
+        # masked out.
+        dip_result = measure_dip_row(row)
+        mask_window = (dip_result['window_start_mjd'], dip_result['window_end_mjd'])
+
     for band in ['g', 'r', 'i']:
         if parsed:
             mjd, mag, magerr = filter_ztf_observations(
@@ -770,7 +799,7 @@ def _plot_light_curve(row, parsed=True, show_bins=False):
                 continue
 
             # Subtract out the zeropoint
-            mjd, mag, magerr = parse_light_curve(mjd, mag, magerr)
+            mjd, mag, magerr = parse_light_curve(mjd, mag, magerr, mask_window)
         else:
             mask = (
                 (np.array(row[f'catflags_{band}']) == 0.)
