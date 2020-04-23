@@ -615,6 +615,39 @@ def measure_dip(mjds, mags, magerrs, min_num_observations=20, min_significant_co
         result['parsed_mag'] = mag
         result['parsed_magerr'] = magerr
 
+    # Figure out how many observations there are that are below a fraction of the peak
+    # depth.
+    deepest_mag = np.max(window_mag)
+    deep_mask = window_mag > 0.2 * deepest_mag
+    deep_mjd = window_mjd[deep_mask]
+    deep_length = deep_mjd[-1] - deep_mjd[0]
+    result['deep_count'] = np.sum(deep_mask)
+    result['deep_length'] = deep_length
+    result['deep_gap_fraction'] = max_gap / deep_length
+
+    # Determine the "complexity" of the dip.
+    diffs = window_mag[1:] - window_mag[:-1]
+    diff_errs = np.sqrt(window_magerr[1:]**2 + window_magerr[:-1]**2)
+    diff_pulls = diffs / diff_errs
+
+    flip_count = 0
+    sign = 0.
+    for pull in diff_pulls:
+        if pull > 3.:
+            if sign == +1.:
+                continue
+            else:
+                flip_count += 1
+                sign = +1
+        if pull < -3.:
+            if sign == -1.:
+                continue
+            else:
+                flip_count += 1
+                sign = -1
+
+    result['flip_count'] = flip_count
+
     return result
 
 
@@ -664,36 +697,6 @@ def measure_dip_row(row, *args, **kwargs):
     return result
 
 
-from functools import wraps
-import errno
-import os
-import time
-import signal
-
-class TimeoutError(Exception):
-    pass
-
-def timeout(seconds=1, error_message=os.strerror(errno.ETIME)):
-    def decorator(func):
-        def _handle_timeout(signum, frame):
-            raise TimeoutError(error_message)
-
-        def wrapper(objid, *args, **kwargs):
-            signal.signal(signal.SIGALRM, _handle_timeout)
-            signal.alarm(seconds)
-            try:
-                result = func(*args, **kwargs)
-            except:
-                raise Exception(f"Failed for objid {objid}!")
-            finally:
-                signal.alarm(0)
-            return result
-
-        return wraps(func)(wrapper)
-
-    return decorator
-
-
 def build_measure_dip_udf(**kwargs):
     """Build a Spark UDF to run `measure_single_dip_ztf`.
 
@@ -723,6 +726,10 @@ def build_measure_dip_udf(**kwargs):
         'ref_observation_count': int,
         'ref_pull_std': float,
         'ref_large_pull_fraction': float,
+        'deep_count': int,
+        'deep_length': float,
+        'deep_gap_fraction': float,
+        'flip_count': int,
     }
 
     sparktype_map = {
@@ -734,7 +741,6 @@ def build_measure_dip_udf(**kwargs):
                     use_type in use_keys.items()]
     schema = stypes.StructType(spark_fields)
 
-    @timeout()
     def _measure_dip_udf(
             mjd_g, mag_g, magerr_g, xpos_g, ypos_g, catflags_g,
             mjd_r, mag_r, magerr_r, xpos_r, ypos_r, catflags_r,
@@ -856,9 +862,8 @@ def plot_light_curve(row, parsed=True, label_dip=True, zoom=False, verbose=True)
     verbose : bool
         If True, print out information about the dip.
     """
-    if 'dip' not in row:
-        # Can only label the dip if it has been identified.
-        label_dip = False
+    if label_dip:
+        dip_result = measure_dip_row(row)
 
     if verbose:
         _print_light_curve_info(row)
@@ -866,21 +871,25 @@ def plot_light_curve(row, parsed=True, label_dip=True, zoom=False, verbose=True)
         if label_dip:
             print("")
             print("Dip details:")
-            for key, value in row['dip'].asDict().items():
+            for key, value in dip_result.items():
                 print(f"{key:11s}: {value}")
 
     ax = _plot_light_curve(row, parsed)
 
     if label_dip:
-        start_mjd = row['dip']['start_mjd']
-        end_mjd = row['dip']['end_mjd']
+        window_start_mjd = dip_result['window_start_mjd']
+        window_end_mjd = dip_result['window_end_mjd']
+        start_mjd = dip_result['start_mjd']
+        end_mjd = dip_result['end_mjd']
 
-        ax.axvline(start_mjd, c='k', ls='--')
+        ax.axvline(start_mjd, c='k', ls='--', label='Dip location')
         ax.axvline(end_mjd, c='k', ls='--')
+        ax.axvline(window_start_mjd, c='C0', label='Window')
+        ax.axvline(window_end_mjd, c='C0')
 
         if zoom:
-            zoom_width = 5 * (end_mjd - start_mjd)
-            ax.set_xlim(start_mjd - zoom_width, end_mjd + zoom_width)
+            pad = (window_end_mjd - window_start_mjd) / 2.
+            ax.set_xlim(window_start_mjd - pad, window_end_mjd + pad)
 
 
 def plot_interactive(rows):
