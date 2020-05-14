@@ -1008,7 +1008,7 @@ def _plot_light_curve(row, parsed=True, show_bins=False):
     else:
         ax.set_ylabel('Magnitude')
     ax.legend()
-    ax.set_title('objid %d' % row['objid'])
+    ax.set_title('objid %d' % row['ps1_objid'])
     ax.invert_yaxis()
 
     return ax
