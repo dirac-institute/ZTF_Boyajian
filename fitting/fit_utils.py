@@ -115,7 +115,7 @@ def evaluate_in_dip(df, model, band):
     return _evaluate_df
 
 def evaluate_around_dip(df, model, band, wiggle):
-    from windowing import around_window_udf
+    from .windowing import around_window_udf
     from spark_curve_fit import evaluate_model_error_udf
     
     x = df[f'mjd_{band}']

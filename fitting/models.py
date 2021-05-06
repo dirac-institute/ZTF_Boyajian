@@ -1,5 +1,5 @@
 from pyspark.sql.types import ArrayType, FloatType
-from fit_utils import make_udf_from_annotated_function
+from .fit_utils import make_udf_from_annotated_function
 
 def skew_normal(x, skew, loc, xscale, yscale, offset):
     from scipy.stats import skewnorm
